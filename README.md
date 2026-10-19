@@ -2,6 +2,12 @@
 
 为小米 L43M7-EA / Android5.1.1 API22 / ARMv7 / 1GB内存制作的电视短剧客户端。当前为侧载测试版，GPL-3.0-only 开源。源码仓库：[dsantial/qingju-tv](https://github.com/dsantial/qingju-tv)。
 
+## 下载安装
+
+[下载青聚0.4.0 APK](https://github.com/dsantial/qingju-tv/releases/download/v0.4.0/QingjuTV-0.4.0-android5.apk) · [版本说明与源码](https://github.com/dsantial/qingju-tv/releases/tag/v0.4.0)
+
+支持Android5.0及以上，已在小米L43M7-EA（Android5.1.1、ARMv7）实测。将APK复制到U盘或使用ADB侧载安装。此包为已实测的调试签名测试版，可覆盖本项目此前同签名版本；不是应用商店正式签名版。
+
 ## 播放修复
 
 - 保留HGTV剧架、排行榜、分类、收藏与历史界面。
