@@ -7,8 +7,8 @@ android {
   applicationId = "local.qingju.tv"
   minSdk = 21
   targetSdk = 35
-  versionCode = 4
-  versionName = "0.4.0"
+  versionCode = 5
+  versionName = "0.4.1"
  }
  compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17; isCoreLibraryDesugaringEnabled = true }
  kotlinOptions { jvmTarget = "17" }

@@ -25,3 +25,43 @@
 - JUnit（测试）：EPL-1.0。
 
 依赖版本见Gradle构建文件。详细上游声明保留于docs/UPSTREAM-NOTICE.md；本项目未打包ZXing或Fluent Emoji图片资产。
+
+
+## 单集播放签名适配（2026-11-13）
+
+`PlayerSignature.kt`、`PlayerSignatureTest.kt`、测试金标 `player-signing.json` 以及播放模型解析 `PlaybackModels.kt` 移植或调整自
+[N3urda/hongguoTV](https://github.com/N3urda/hongguoTV/tree/21ec92206fbfca1d88127c1a4bd1e86a1bab79bf/kotlin-tv)，
+固定提交 `21ec92206fbfca1d88127c1a4bd1e86a1bab79bf`，遵循 GPL-3.0-only；青聚修改包名以接入已有核心模块，并精简模型解析以保持现有播放队列与 Android 5 兼容。
+测试金标由上游使用独立 Go 实现、固定时钟与 nonce 生成，不含真实设备身份或媒体地址。
+
+上游 Argus/Simon 结构参考并改写自 [tr4cex/TikTok-Encryption](https://github.com/tr4cex/TikTok-Encryption)（MIT），保留其完整许可如下：
+
+```text
+MIT License
+
+Copyright (c) 2024 TikTok Encryption Project
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+EDUCATIONAL USE DISCLAIMER:
+This software is intended for educational and research purposes only.
+Users are responsible for ensuring their use complies with applicable laws
+and terms of service. The authors disclaim any responsibility for misuse
+of this software.
+```

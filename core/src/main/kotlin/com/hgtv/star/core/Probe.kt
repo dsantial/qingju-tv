@@ -5,6 +5,34 @@ private val tag=Regex("""\[([^\[\]【】［］\r\n]{1,16})\]|【([^\[\]【】［
 
 fun main(args: Array<String>) {
     val repository=ContentRepository()
+    if(args.contains("--playback")) {
+        // Register before probing playback. Never print device IDs, cookies or signed URLs.
+        val client=repository.http.newBuilder().addInterceptor { chain ->
+            val response=chain.proceed(chain.request())
+            println("request host=${chain.request().url.host} path=${chain.request().url.encodedPath} http=${response.code} bytes=${response.body?.contentLength()}")
+            response
+        }.build()
+        val probe=ContentRepository(client)
+        try {
+            val profileAt=args.indexOf("--profile-file")
+            probe.registerProfile=if(profileAt>=0) {
+                val json=org.json.JSONObject(java.io.File(args[profileAt+1]).readText())
+                json.keys().asSequence().associateWith { json.getString(it) }
+            } else mapOf("cdid" to java.util.UUID.randomUUID().toString(),"openudid" to java.util.UUID.randomUUID().toString().replace("-", "").take(16))
+            check(probe.registerDevice()!=null) { "Device registration failed" }
+            println("registration=success")
+            val seriesId=args.firstOrNull { it.matches(Regex("[0-9]{1,30}")) }
+                ?: probe.rank(1,RankBoard.COMIC).items.first().id
+            val detail=probe.detail(seriesId)
+            println("detail=success episodes=${detail.episodes.size}")
+            val info=probe.stream(detail.episodes.first())
+            println("stream=success quality=${info.quality}")
+            RemoteVideo(client,info).use { video -> video.prepare(); println("media=success total=${video.total}") }
+        } finally {
+            client.connectionPool.evictAll(); client.dispatcher.executorService.shutdown()
+        }
+        return
+    }
     // 搜索接口要求登录态（匿名设备返回 200 + 空 body），联调时可用 --token <x-tt-token> 带上。
     val tokenAt=args.indexOf("--token")
     if(tokenAt>=0) repository.sessionToken=args.getOrNull(tokenAt+1)

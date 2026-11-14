@@ -1,10 +1,16 @@
-# 青聚 0.4.0
+# 青聚 0.4.1
 
-为小米 L43M7-EA / Android5.1.1 API22 / ARMv7 / 1GB内存制作的电视短剧客户端。当前为侧载测试版，GPL-3.0-only 开源。源码仓库：[dsantial/qingju-tv](https://github.com/dsantial/qingju-tv)。
+面向老电视适配的短剧、漫剧客户端，让 Android 5.0 及以上的旧电视通过遥控器浏览、搜索和播放内容，支持倍速、清晰度选择、观看记录与连续播放。
+
+重点适配小米 L43M7-EA：Android 5.1.1 / API22、32位 ARMv7、1GB内存，已在该设备实测；其他电视的兼容性仍需验证。当前为侧载测试版，GPL-3.0-only 开源。源码仓库：[dsantial/qingju-tv](https://github.com/dsantial/qingju-tv)。
+
+## 0.4.1 播放协议修复
+
+更新单集取流的 Gorgon/Argus/Ladon 签名，替换失效的旧播放签名；兼容新的数组视频模型、加密信息和清晰度字段。保留已有界面、遥控操作、倍速及下一集限量预取。匿名播放请求不携带账号 Cookie，重试限制在三条线路，服务端明确拒绝时停止重试。来源和许可见[NOTICE](NOTICE.md)。
 
 ## 下载安装
 
-[下载青聚0.4.0 APK](https://github.com/dsantial/qingju-tv/releases/download/v0.4.0/QingjuTV-0.4.0-android5.apk) · [版本说明与源码](https://github.com/dsantial/qingju-tv/releases/tag/v0.4.0)
+[下载青聚0.4.1 APK](https://github.com/dsantial/qingju-tv/releases/download/v0.4.1/QingjuTV-0.4.1-android5.apk) · [版本说明、源码与校验](https://github.com/dsantial/qingju-tv/releases/tag/v0.4.1)
 
 支持Android5.0及以上，已在小米L43M7-EA（Android5.1.1、ARMv7）实测。将APK复制到U盘或使用ADB侧载安装。此包为已实测的调试签名测试版，可覆盖本项目此前同签名版本；不是应用商店正式签名版。
 
@@ -23,7 +29,7 @@
 
 ## 验证
 
-0.4.0已在目标电视实测：遥控暂停、1080P、2倍速、画面放大和提前预取跨集均正常，用户确认暂停正常、切集更顺畅。详细范围见[验证说明](docs/VALIDATION.md)。仅抽样验证，不保证所有片源或网络条件下零间隔。
+0.4.1已在目标电视实测恢复1080P/2倍速横屏播放，用户确认画面和声音正常；历史与暂停/续播、自动跨集保留。此前0.4.0已实测：遥控暂停、1080P、2倍速、画面放大和提前预取跨集均正常，用户确认暂停正常、切集更顺畅。详细范围见[验证说明](docs/VALIDATION.md)。仅抽样验证，不保证所有片源或网络条件下零间隔。
 
 ## 构建与安装
 

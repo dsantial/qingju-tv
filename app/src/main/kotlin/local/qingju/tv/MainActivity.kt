@@ -274,7 +274,14 @@ class MainActivity : Activity() {
                 if (error is ThreadDeath || error is VirtualMachineError) throw error
                 val explanation = explain(error)
                 android.util.Log.w("QingjuTV", "request failed: $explanation")
-                main.post { if (!destroyed && token == ticket) { status.text = if(online()) "暂时无法播放，请重试或换一部。" else "网络未连接，请检查电视网络。"; failure = explanation; retryButton?.visibility=View.VISIBLE; showControls() } }
+                main.post { if (!destroyed && token == ticket) {
+                    status.text = when {
+                        !online() -> "网络未连接，请检查电视网络。"
+                        explanation.contains("播放接口暂不可用") -> "视频源未返回播放地址，请稍后重试。"
+                        else -> "暂时无法播放，请重试或换一部。"
+                    }
+                    failure = explanation; retryButton?.visibility=View.VISIBLE; showControls()
+                } }
             }
         }
     }

@@ -199,6 +199,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
      * 取播放地址必然空响应——那一集永远预取不命中。
      */
     fun inheritDevice(from: ContentRepository) {
+        registerProfile=from.registerProfile
         deviceIdentity=from.deviceIdentity
         registrationCookies=from.registrationCookies
     }
@@ -208,6 +209,10 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
      * 由界面层从本机设置注入（见 `Library.deviceProfile`）。
      */
     @Volatile var registerProfile: Map<String,String> = emptyMap()
+        set(value) {
+            field=LinkedHashMap(value.filterValues { it.isNotBlank() })
+            signer.updateDevice(deviceProfile())
+        }
     /**
      * 匿名注册一台设备，拿到平台认可的 `device_id` / `install_id`。
      *
@@ -240,15 +245,17 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     @Volatile private var registrationCookies: Map<String,String> = emptyMap()
         set(value) { field=LinkedHashMap(value) }
     /**
-     * 签名与设备参数共用的**三层合并档案**（后一层压前一层）：
+     * 签名与设备参数共用的合并档案（后一层压前一层）：
      *
      * 1. [VendorConstants.device]：内置档案，兜底用；
-     * 2. [deviceIdentity]：本机身份（`device_id` / `iid`），来自 [registerDevice] 的注册结果；
-     * 3. [credentials] 带来的**真机档案**：`device_type` / `cdid` / `klink_egdi` / `rom_version` …，
+     * 2. [registerProfile]：注册时使用的本机机型、系统与安装标识；
+     * 3. [deviceIdentity]：本机身份（`device_id` / `iid`），来自 [registerDevice] 的注册结果；
+     * 4. [credentials] 带来的**真机档案**：`device_type` / `cdid` / `klink_egdi` / `rom_version` …，
      *    写接口（追剧 / 进度）要与凭据一致，因此它优先级最高。
      */
     private fun deviceProfile(): Map<String,String> =
         LinkedHashMap(VendorConstants.device).apply {
+            putAll(registerProfile)
             putAll(deviceIdentity)
             credentials?.device?.forEach { (key,value) -> if(value.isNotBlank()) this[key]=value }
         }
@@ -279,13 +286,6 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     private val RELATED_CACHE_LIMIT=16
     private val relatedCache=linkedMapOf<String,RelatedWorks>()
     private val commentHosts=listOf("api5-normal-sinfonlinea.fqnovel.com","api5-normal-sinfonlinec.fqnovel.com","api5-normal-sinfonlineb.fqnovel.com","api5-normal-lf.fqnovel.com","api5-normal-lq.fqnovel.com","api5-normal-hl.fqnovel.com")
-    /**
-     * 播放接口空响应体的原地重发次数。
-     *
-     * 平台 2026-10-15 起对匿名设备一律回 `200 + 0 字节`；带上登录态后基本稳定，
-     * 但仍偶发，因此同一条路径上先重发几次再换下一条——否则会把唯一能用的那条也跳过去。
-     */
-    private val PLAYBACK_RETRIES=3
     private fun text(url: String, signed: Signer.Request? = null): String {
         val request = Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).header("Accept-Language","zh-CN,zh;q=0.9")
         signed?.headers?.forEach { (k,v) -> request.header(k,v) }
@@ -1071,114 +1071,76 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         }
         return rows.values.toList()
     }
-    /**
-     * 取一集的播放模型（`video_model`）。
-     *
-     * 平台 2026-10-14 又改了一次播放接口：原先带场景段的
-     * `/novel/player/multi_video_model/:dr_scene/v1/` 现在一律返回 **HTTP 200 + 空响应体**，
-     * 旧路径 `/novel/player/multi_video_model/v1/` 返回 `Code 110001 未知异常`，
-     * 表现出来还是「所有影片都放不了」。现在能用的那条是 `/novel/player/video_model/v1/`，
-     * 而且**请求体形态也变了**：要 `video_id` 单值，不再是 `mixed_video_id_map`
-     *（给 `mixed_video_id_map` / `vid` / `video_ids` 都返回 `100001 video_id invalid`）。
-     *
-     * 因此按「新路由 → 带场景段 → 旧路径」的顺序试，第一个能取到 `video_model` 的用；
-     * 全失败时抛出最后一个错误，界面照常显示「播放接口暂不可用」。
-     *
-     * **空响应体必须当失败**：网关在业务处理前挡掉请求时就是 `200 + 0 字节`，
-     * 这时业务码取不到、默认成 0，不判空就会被当成成功往下走（0.15.0 那次改版栽的就是这个）。
-     *
-     * 2026-10-15 平台又加了一道门槛：**匿名请求一律 `200 + 0 字节`**，路径与请求体都没变，
-     * 因此五条候选路径会全部走完、最后抛出最后一条的错误码（`110001`），
-     * 表现出来还是「所有影片都放不了」。带上账号 Cookie 后同一个请求 15/15 稳定命中 `code 0`，
-     * 所以这里给播放请求补上 `Cookie` 头。
-     *
-     * 补的**只有** `Cookie`：这个接口对 `x-tt-token` 的长度敏感（实测 ≥99 字符直接判死），
-     * 而账号凭据那份整段 cookie 串有 800 多字符，同时塞进 `x-tt-token` 会让请求回空
-     *（搜索接口容忍这种写法，播放接口不容忍——真 App 用的是 355 字符的 hex token）。
+    /** Current single-video protocol: real Argus/Gorgon/Ladon, without catalogue/account cookies.
+     * Protocol profile follows PlayerSignature's declared SDK environment; the registered ID stays
+     * local to this installation. Catalogue queries continue to use the local/credential profile.
      */
+    private class PlaybackRejected(message: String): IOException(message)
+
     private fun videoModel(id: String): JSONObject {
-        val host="https://api5-normal-sinfonlineb.fqnovel.com"
-        val biz="""{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024}"""
-        // 新路由要 `video_id` 单值；带场景段与旧路径要 `mixed_video_id_map`（1004 = 短剧）。
-        val videoMap="""{"biz_param":$biz,"mixed_video_id_map":{"1004":["$id"]}}"""
-        val candidates=listOf(
-            "/novel/player/video_model/v1/" to """{"video_id":"$id","biz_param":$biz}""",
-            "/novel/player/multi_video_model/preload/v1/" to videoMap,
-            "/novel/player/multi_video_model/default/v1/" to videoMap,
-            "/novel/player/multi_video_model/detail/v1/" to videoMap,
-            "/novel/player/multi_video_model/v1/" to videoMap
-        )
-        var failure: IOException?=null
-        candidates.forEach { (path,body) ->
-            val attempt=runCatching {
-                val payload=body.toByteArray()
-                // 播放接口对**匿名设备**也放行（官方 App 冷启动未登录即可播放，见 HAR），
-                // 前提是这台设备已在服务端注册过（见 [registerDevice]）：未注册回 `101000 服务异常`
-                // 或 `200 + 0 字节`，注册后回 `code 0` + 完整播放模型。
-                // 因此这里用合并档案（含本机身份，见 [deviceProfile]），并带上注册下发的设备 Cookie；
-                // 有账号凭据时以凭据的整段 Cookie 为准。
-                val cookie=credentials?.cookie?.takeIf { it.isNotBlank() }
-                    ?: registrationCookies.entries.joinToString("; ") { (name,value) -> "$name=$value" }.takeIf { it.isNotEmpty() }
-                var response=""
-                var blankRetry=0
-                while(true) {
-                    val signed=signer.sign(host+path,deviceProfile(),payload)
-                    val request=if(cookie==null) signed else signed.copy(headers=signed.headers+linkedMapOf("Cookie" to cookie))
-                    response=text(signed.url,request)
-                    // 网关挡掉请求时是 200 + 0 字节：业务码取不到会默认成 0，必须先判空。
-                    // 空响应先原地重发几次再换下一条：否则会把唯一能用的那条路径也跳过去。
-                    if(response.isNotBlank() || blankRetry>=PLAYBACK_RETRIES) break
-                    blankRetry++
-                    Thread.sleep(200L+blankRetry*200L)
+        if (deviceIdentity.isEmpty() && registerDevice() == null) throw IOException("播放设备注册失败，请稍后重试")
+        val allowed = setOf("ac", "channel", "aid", "app_name", "version_code", "version_name",
+            "device_platform", "os", "ssmix", "device_type", "device_brand", "language", "os_api",
+            "os_version", "manifest_version_code", "resolution", "dpi", "update_version_code", "device_id", "iid")
+        val profile = (VendorConstants.device + deviceIdentity).filterKeys { it in allowed } + mapOf(
+            "version_code" to "73532", "version_name" to "7.3.5.32",
+            "manifest_version_code" to "73532", "update_version_code" to "73532")
+        val payload = """{"biz_param":{"need_all_video_definition":true,"video_platform":3},"content_type":1,"video_id":"$id"}""".toByteArray()
+        val client = http.newBuilder().cookieJar(okhttp3.CookieJar.NO_COOKIES)
+            .connectTimeout(5, TimeUnit.SECONDS).readTimeout(8, TimeUnit.SECONDS).callTimeout(10, TimeUnit.SECONDS).build()
+        var failure: IOException? = null
+        for (host in listOf("api5-normal-sinfonlineb.fqnovel.com", "api5-normal-hl.fqnovel.com", "api5-normal-lf.fqnovel.com")) {
+            try {
+                val now = clock()
+                val query = Signer.encode((profile + ("_rticket" to now.toString())).toSortedMap())
+                val request = Request.Builder().url("https://$host/novel/player/video_model/v1/?$query")
+                    .header("User-Agent", VendorConstants.VIDEO_UA.replace("/71332", "/73532"))
+                    .header("Accept", "application/json").header("Sdk-Version", "2").header("X-XS-From-Web", "0")
+                    .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                PlayerSignature().headers(query, payload, profile.getValue("device_id"), now)
+                    .forEach { (key, value) -> request.header(key, value) }
+                val raw = RequestScope.execute(client.newCall(request.build())) { response ->
+                    if (response.code in listOf(401, 403, 429)) throw PlaybackRejected("播放请求被拒绝（HTTP ${response.code}），请稍后重试")
+                    if (!response.isSuccessful) throw IOException("播放请求失败（HTTP ${response.code}）")
+                    val body = response.body ?: throw IOException("播放接口暂不可用（空响应）")
+                    val limit = 2 * 1024 * 1024
+                    if (body.contentLength() > limit) throw PlaybackRejected("播放信息过大")
+                    val out = java.io.ByteArrayOutputStream()
+                    body.byteStream().use { input ->
+                        val buffer = ByteArray(8192)
+                        while (out.size() <= limit) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            out.write(buffer, 0, count)
+                        }
+                    }
+                    if (out.size() > limit) throw PlaybackRejected("播放信息过大")
+                    out.toString("UTF-8")
                 }
-                if(response.isBlank()) throw IOException("播放接口暂不可用（空响应）")
-                val data=JSONObject(response)
-                val code=data.optInt("Code",data.optInt("code",0))
-                // 业务码非 0 就是这一条路不通（110001 是旧路径的「未知异常」，100001 是参数错误）。
-                if(code!=0) throw IOException("播放接口暂不可用（${code}）")
-                videoModelOf(data) ?: throw IOException("播放接口暂不可用（没有播放模型）")
+                if (raw.isBlank()) throw IOException("播放接口暂不可用（空响应）")
+                val root = runCatching { JSONObject(raw) }.getOrElse { throw PlaybackRejected("播放信息格式异常") }
+                val code = root.optInt("Code", root.optInt("code", root.optJSONObject("BaseResp")?.optInt("StatusCode", 0) ?: 0))
+                if (code != 0) throw PlaybackRejected("播放接口拒绝请求（$code），请稍后重试")
+                val data = root.optJSONObject("data") ?: throw PlaybackRejected("播放信息为空")
+                return PlaybackModels.model(data, id) ?: throw PlaybackRejected("播放信息格式异常")
+            } catch (error: PlaybackRejected) {
+                throw error
+            } catch (error: IOException) {
+                if (Thread.currentThread().isInterrupted) throw error
+                failure = error
             }
-            attempt.getOrNull()?.let { return it }
-            failure=attempt.exceptionOrNull() as? IOException ?: IOException(attempt.exceptionOrNull()?.message ?: "播放接口暂不可用")
         }
         throw failure ?: IOException("播放接口暂不可用")
     }
-    /**
-     * 从播放接口响应里取出 `video_model`：新路由在 `data.video_model`，
-     * 带场景段 / 旧路径在 `data[<vid>].video_model`。
-     * `video_model` 可能是对象，也可能是**字符串化的 JSON**，两种都要处理。
-     */
-    private fun videoModelOf(data: JSONObject): JSONObject? {
-        val root=data.optJSONObject("data") ?: return null
-        model(root.opt("video_model"))?.let { return it }
-        val entry=root.keys().asSequence().mapNotNull { root.optJSONObject(it) }.firstOrNull() ?: return null
-        return model(entry.opt("video_model"))
-    }
-    private fun model(value: Any?): JSONObject? = when(value) {
-        is JSONObject -> value
-        is String -> runCatching { JSONObject(value) }.getOrNull()
-        else -> null
-    }
+
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
-        val model=videoModel(id)
-        val raw=model.opt("fallback_api")
-        val fallback=when(raw) { is JSONObject -> raw.str("fallback_api"); is JSONArray -> raw.optString(0); else -> runCatching { JSONObject(raw.toString()).str("fallback_api") }.getOrDefault(raw.toString()) }
-        if(!fallback.startsWith("https://")) throw IOException("播放地址格式异常")
-        val info=JSONObject(text(fallback)).optJSONObject("video_info")?.optJSONObject("data") ?: throw IOException("没有播放资源")
-        val videoList=info.optJSONObject("video_list") ?: throw IOException("没有可用清晰度")
-        // ByteVC2 resources can expose playable audio but no video track in Android's MP4 extractor.
-        // Keep missing legacy codec labels usable, but never select a known incompatible variant.
-        val rows=videoList.keys().asSequence().mapNotNull { k -> videoList.optJSONObject(k)?.let { k to it } }.filter {
-            it.second.str("main_url").isNotEmpty() && it.second.str("codec_type").lowercase() !in setOf("bytevc2","bvc2")
-        }.map { (k,o) -> Triple(qualityNumber(o.str("quality_desc").ifEmpty { o.str("height").ifEmpty { o.str("vheight").ifEmpty { o.str("quality").ifEmpty { k } } } }),k,o) }.sortedByDescending { it.first }.toList()
-        val selected=rows.firstOrNull { it.first<=maxQuality } ?: rows.lastOrNull() ?: throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
-        val item=selected.third; var url=cleanUrl(item.str("main_url")); val seed=info.str("key_seed")
-        if(seed.isNotEmpty()) url=MediaCrypto.decryptUrl(url,decode64(seed))
-        if(!url.startsWith("https://") && !url.startsWith("http://")) throw IOException("播放地址无效")
-        val key=item.str("spade_a").takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
-        val quality=if(selected.first>0) "${selected.first}P"+(if(selected.first>maxQuality) "（兼容资源）" else "") else "自动"
-        return StreamInfo(url,key,quality)
+        val model = videoModel(id)
+        val info = if (model.has("video_list")) model else {
+            val fallback = PlaybackModels.fallback(model) ?: throw IOException("播放地址格式异常")
+            JSONObject(text(fallback)).optJSONObject("video_info")?.optJSONObject("data") ?: throw IOException("没有播放资源")
+        }
+        return PlaybackModels.pick(PlaybackModels.candidates(info), maxQuality)
     }
     /**
      * 取一集的弹幕，也就是「原 App」播放时看到的同一份数据。

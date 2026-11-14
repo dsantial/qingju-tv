@@ -12,139 +12,131 @@ import org.junit.Test
 import java.io.IOException
 
 class ContentRepositoryTest {
-    /**
-     * 新路由 `/novel/player/video_model/v1/` 的响应：`video_model` 直接挂在 `data` 下
-     * （带场景段与旧路径挂在 `data[<vid>]` 下，见 [legacyVideoModel]）。
-     */
     private fun videoModel(fallback: String) =
-        """{"BaseResp":{"StatusCode":0},"code":0,"data":{"video_model":"{\"fallback_api\":\"$fallback\"}"}}"""
-    /** 带场景段 / 旧路径的响应形态：`data[<vid>].video_model`。 */
-    private fun legacyVideoModel(fallback: String) =
-        """{"BaseResp":{"StatusCode":0},"code":0,"data":{"123":{"video_model":"{\"fallback_api\":\"$fallback\"}"}}}"""
-    /** `fallback_api` 地址上的清晰度列表（`video_list` 为空时 stream 会报「没有电视可播放的清晰度」）。 */
+        """{"code":0,"data":{"video_model":{"fallback_api":"$fallback"}}}"""
+
     private fun fallbackList(vararg rows: Pair<String,String>) = JSONObject()
         .put("video_info",JSONObject().put("data",JSONObject().put("video_list",
             JSONObject().also { list -> rows.forEachIndexed { i,(codec,url) ->
                 list.put("video_$i",JSONObject().put("vheight",1080).put("codec_type",codec).put("main_url",url)) } })))
         .toString()
 
-    /**
-     * 平台 2026-10-14 又把播放接口换了一条：原先带场景段的
-     * `/novel/player/multi_video_model/:dr_scene/v1/` 现在一律返回 **HTTP 200 + 空响应体**，
-     * 旧路径返回 `Code 110001 未知异常`；能用的只有 `/novel/player/video_model/v1/`，
-     * 且要 `video_id` 单值。这里钉住四件事：新路由排在最前、空响应体必须当失败、
-     * 新路由不通时依次退到带场景段与旧路径、全失败时如实报错。
-     */
-    @Test fun playbackPrefersTheVideoIdRouteAndIgnoresBusinessErrors() {
-        val paths=mutableListOf<String>()
-        val repo=repository { request ->
-            if(request.url.host!="example.com") paths+=request.url.encodedPath
-            when {
-                request.url.host=="example.com" -> fallbackList("h264" to "https://example.com/stream")
-                request.url.encodedPath=="/novel/player/video_model/v1/" -> videoModel("https://example.com/stream")
-                else -> """{"Code":110001,"Message":"未知异常"}"""
-            }
-        }
-        val stream=repo.stream("123")
-        assertEquals("https://example.com/stream",stream.url)
-        assertEquals(listOf("/novel/player/video_model/v1/"),paths)
-    }
-
-    /**
-     * 新路由的请求体必须是 `video_id` 单值：给它 `mixed_video_id_map` 会返回
-     * `100001 video_id invalid`，所以两条路的 body 形态不能混用。
-     */
-    @Test fun videoIdRouteSendsTheSingleVideoIdBodyInsteadOfTheLegacyMap() {
+    @Test fun playbackUsesTheSingleVideoProtocolBeforeReadingTheMediaModel() {
         val requests=mutableListOf<Request>()
         val repo=repository { request ->
-            if(request.url.host!="example.com") requests+=request
-            when {
-                request.url.host=="example.com" -> fallbackList("h264" to "https://example.com/stream")
-                request.url.encodedPath=="/novel/player/video_model/v1/" -> videoModel("https://example.com/stream")
-                else -> ""
+            requests+=request
+            if(request.url.host=="example.com") fallbackList("h264" to "https://example.com/stream")
+            else videoModel("https://example.com/stream")
+        }
+        assertEquals("https://example.com/stream",repo.stream("123").url)
+        val modelRequest=requests.first()
+        assertEquals("api5-normal-sinfonlineb.fqnovel.com",modelRequest.url.host)
+        assertEquals("/novel/player/video_model/v1/",modelRequest.url.encodedPath)
+        assertEquals(2,requests.size)
+    }
+
+    @Test fun singleProtocolBindsTheActualBodyAndUsesCompleteAnonymousSignatures() {
+        val requests=mutableListOf<Request>()
+        val repo=repository { request ->
+            requests+=request
+            if(request.url.host=="example.com") fallbackList("h264" to "https://example.com/stream")
+            else videoModel("https://example.com/stream")
+        }
+        repo.credentials=AccountCredentials(cookie="sessionid=test-account-cookie",device=mapOf("device_id" to "303","iid" to "404"))
+        repo.sessionToken="test-account-token"
+        repo.stream("123")
+        val sent=requests.first()
+        assertEquals("POST",sent.method)
+        // Application interceptors run before OkHttp adds the body's Content-Type header.
+        assertTrue(sent.body!!.contentType().toString().startsWith("application/json"))
+        val raw=okio.Buffer().also { sent.body!!.writeTo(it) }.readUtf8()
+        val payload=JSONObject(raw)
+        assertEquals(setOf("video_id","content_type","biz_param"),payload.keySet())
+        assertEquals("123",payload.getString("video_id"))
+        assertEquals(1,payload.getInt("content_type"))
+        val biz=payload.getJSONObject("biz_param")
+        assertTrue(biz.getBoolean("need_all_video_definition"))
+        assertEquals(3,biz.getInt("video_platform"))
+        assertFalse(payload.has("mixed_video_id_map"))
+        assertEquals("73532",sent.url.queryParameter("version_code"))
+        assertEquals("101",sent.url.queryParameter("device_id"))
+        assertEquals("202",sent.url.queryParameter("iid"))
+        assertNull(sent.url.queryParameter("ts"))
+        assertNotNull(sent.url.queryParameter("_rticket"))
+        for(header in listOf("X-Gorgon","X-Khronos","X-Argus","X-Ladon","X-SS-STUB")) assertNotNull(header,sent.header(header))
+        assertTrue(decode64(sent.header("X-Argus")!!).size>32)
+        assertTrue(decode64(sent.header("X-Ladon")!!).size>4)
+        assertNull(sent.header("X-Medusa"))
+        assertNull(sent.header("Cookie"))
+        assertNull(sent.header("X-TT-Token"))
+    }
+
+    @Test fun emptyBodyMovesToTheNextHostWithoutCallingObsoleteBatchRoutes() {
+        val hosts=mutableListOf<String>()
+        val repo=repository { request ->
+            if(request.url.host=="example.com") fallbackList("h264" to "https://example.com/stream")
+            else {
+                hosts+=request.url.host
+                assertEquals("/novel/player/video_model/v1/",request.url.encodedPath)
+                if(hosts.size==1) "" else videoModel("https://example.com/stream")
             }
         }
         assertEquals("https://example.com/stream",repo.stream("123").url)
-        val sent=requests.single()
-        assertEquals("/novel/player/video_model/v1/",sent.url.encodedPath)
-        val body=sent.body?.let { payload -> okio.Buffer().also { buffer -> payload.writeTo(buffer) }.readUtf8() } ?: ""
-        assertTrue(body,body.contains("\"video_id\":\"123\""))
-        assertFalse(body,body.contains("mixed_video_id_map"))
+        assertEquals(listOf("api5-normal-sinfonlineb.fqnovel.com","api5-normal-hl.fqnovel.com"),hosts)
     }
 
-    /**
-     * 网关在业务处理前挡掉请求时是 `HTTP 200 + 0 字节`：这时业务码取不到、默认成 0，
-     * 不判空就会被当成成功往下走，用户看到的是「播放接口暂不可用」但错误信息是 `（0）`。
-     */
-    @Test fun blankResponseBodyCountsAsFailureAndMovesToTheNextRoute() {
-        val paths=mutableListOf<String>()
+    @Test fun aTransportFailureCanRecoverOnTheNextConfiguredHost() {
+        val hosts=mutableListOf<String>()
         val repo=repository { request ->
-            if(request.url.host!="example.com") paths+=request.url.encodedPath
-            when {
-                request.url.host=="example.com" -> fallbackList("h264" to "https://example.com/stream")
-                request.url.encodedPath=="/novel/player/video_model/v1/" -> ""
-                request.url.encodedPath=="/novel/player/multi_video_model/preload/v1/" -> legacyVideoModel("https://example.com/stream")
-                else -> """{"Code":110001,"Message":"未知异常"}"""
+            if(request.url.host=="example.com") fallbackList("h264" to "https://example.com/stream")
+            else {
+                hosts+=request.url.host
+                if(hosts.size==1) throw java.net.SocketTimeoutException("synthetic timeout")
+                videoModel("https://example.com/stream")
             }
         }
         assertEquals("https://example.com/stream",repo.stream("123").url)
-        // 空响应会**原地重发几次**再换下一路（网关偶发挡掉时重发即好，见 `PLAYBACK_RETRIES`），
-        // 因此这里只钉住顺序：同一路可以重复，但必须**依次**走过、最终落到下一条。
-        assertEquals(
-            listOf("/novel/player/video_model/v1/","/novel/player/multi_video_model/preload/v1/"),
-            paths.distinct()
-        )
-        assertTrue(paths.first()=="/novel/player/video_model/v1/")
-        assertTrue(paths.last()=="/novel/player/multi_video_model/preload/v1/")
+        assertEquals(2,hosts.size)
     }
 
-    /** 新路由通了但没给 `video_model`（例如只有 `data.disable_vsr` 这类字段）时也要继续换路。 */
-    @Test fun responseWithoutVideoModelMovesToTheNextRoute() {
-        val paths=mutableListOf<String>()
-        val repo=repository { request ->
-            if(request.url.host!="example.com") paths+=request.url.encodedPath
-            when {
-                request.url.host=="example.com" -> fallbackList("h264" to "https://example.com/stream")
-                request.url.encodedPath=="/novel/player/video_model/v1/" -> """{"code":0,"data":{"disable_vsr":true}}"""
-                request.url.encodedPath=="/novel/player/multi_video_model/detail/v1/" -> legacyVideoModel("https://example.com/stream")
-                else -> ""
-            }
-        }
-        assertEquals("https://example.com/stream",repo.stream("123").url)
-        // 同前：每一条都可能重发几次，只钉住「依次走过、最终落到给得出模型的那条」。
-        assertEquals(listOf(
-            "/novel/player/video_model/v1/",
-            "/novel/player/multi_video_model/preload/v1/",
-            "/novel/player/multi_video_model/default/v1/",
-            "/novel/player/multi_video_model/detail/v1/"
-        ),paths.distinct())
+    @Test fun aBusinessRejectionStopsInsteadOfTryingMoreHosts() {
+        var requests=0
+        val repo=repository { requests++; """{"code":110001,"message":"synthetic rejection"}""" }
+        val error=assertThrows(IOException::class.java) { repo.stream("123") }
+        assertTrue(error.message.orEmpty().contains("110001"))
+        assertEquals(1,requests)
     }
 
-    /** 新路由不可用时退回旧路径：老账号 / 灰度环境上仍然要能播。 */
-    @Test fun playbackFallsBackToTheLegacyRouteWhenTheNewRouteFails() {
-        val paths=mutableListOf<String>()
-        val repo=repository { request ->
-            if(request.url.host!="example.com") paths+=request.url.encodedPath
-            when {
-                request.url.host=="example.com" -> fallbackList("h264" to "https://example.com/legacy")
-                request.url.encodedPath=="/novel/player/multi_video_model/v1/" -> legacyVideoModel("https://example.com/legacy")
-                else -> """{"Code":110001,"Message":"未知异常"}"""
-            }
-        }
-        assertEquals("https://example.com/legacy",repo.stream("123").url)
-        assertEquals("/novel/player/multi_video_model/v1/",paths.last())
-    }
-
-    /** 五条路都只有业务错误码或空响应时必须如实报错，不能把空 data 当成成功往下走。 */
-    @Test fun playbackReportsFailureWhenEveryRouteAnswersWithABusinessError() {
-        val repo=repository { """{"Code":110001,"Message":"未知异常","BaseResp":{"StatusCode":110001}}""" }
+    @Test fun nonemptyMalformedModelIsNotRetriedAsAnEmptyResponse() {
+        var requests=0
+        val repo=repository { requests++; """{"code":0,"data":{"disable_vsr":true}}""" }
         assertThrows(IOException::class.java) { repo.stream("123") }
+        assertEquals(1,requests)
     }
 
-    /** 五条路全是空响应体（当前平台对带场景段那几条的实际行为）时也要报错，而不是往下走。 */
-    @Test fun playbackReportsFailureWhenEveryRouteAnswersWithAnEmptyBody() {
-        val repo=repository { "" }
+    @Test fun anEmptyResponseHasAtMostOneAttemptPerConfiguredHost() {
+        val hosts=mutableListOf<String>()
+        val repo=repository { request -> hosts+=request.url.host; "" }
         assertThrows(IOException::class.java) { repo.stream("123") }
+        assertEquals(listOf("api5-normal-sinfonlineb.fqnovel.com","api5-normal-hl.fqnovel.com","api5-normal-lf.fqnovel.com"),hosts)
+    }
+
+    @Test fun arrayModelUsesCompatibleRenditionsWithoutFetchingAnExtraFallback() {
+        val requests=mutableListOf<Request>()
+        val rows=JSONArray()
+        fun variant(quality: String,codec: String,url: String)=JSONObject()
+            .put("main_url",url)
+            .put("video_meta",JSONObject().put("definition",quality).put("codec_type",codec))
+            .put("encrypt_info",JSONObject().put("encrypt",false))
+        rows.put(variant("720p","bytevc2","https://example.com/unsupported"))
+        rows.put(variant("480p","h264","https://example.com/compatible"))
+        rows.put(variant("1080p","bytevc1","https://example.com/high"))
+        val response=JSONObject().put("code",0).put("data",JSONObject().put("video_model",JSONObject().put("video_list",rows))).toString()
+        val repo=repository { request -> requests+=request; response }
+        val stream=repo.stream("123",720)
+        assertEquals("https://example.com/compatible",stream.url)
+        assertEquals("480P",stream.quality)
+        assertEquals(1,requests.size)
     }
 
     private fun streamRepository(vararg variants: Triple<Int,String,String>) = repository { request ->
@@ -182,7 +174,7 @@ class ContentRepositoryTest {
             Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
                 .code(200).message("OK").body(respond(chain.request()).toResponseBody()).build()
         }.build(),clock
-    )
+    ).apply { deviceIdentity=mapOf("device_id" to "101","iid" to "202") }
 
     private fun rankPayload(page: Int = 1, totalPages: Int = 2) = JSONObject()
         .put("isSuccess",true)
