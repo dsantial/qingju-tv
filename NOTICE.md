@@ -65,3 +65,7 @@ Users are responsible for ensuring their use complies with applicable laws
 and terms of service. The authors disclaim any responsibility for misuse
 of this software.
 ```
+
+## 编码兼容与季度选择（2026-11-14）
+
+0.4.2 的备用模型与兼容编码请求逻辑参考上述固定 GPL 提交的 `ContentRepository.kt`；仍检查真实返回的编码，不解除旧电视的 ByteVC2 过滤。新增同系列季度查询与缓存、遥控选择界面、独立季度观看进度切换，以及取流全空时有冷却限制的匿名会话恢复。本次新增实现按 GPL-3.0-only 提供，没有引入额外原生 SDK 或借用他人账号凭据。

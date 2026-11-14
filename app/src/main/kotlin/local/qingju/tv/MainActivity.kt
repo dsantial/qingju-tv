@@ -39,6 +39,7 @@ class MainActivity : Activity() {
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
     private val cleanup = Executors.newSingleThreadExecutor()
+    private val seasonWorker = Executors.newSingleThreadExecutor()
     private val repository = ContentRepository()
     private val prefs by lazy { getSharedPreferences("qingju", Context.MODE_PRIVATE) }
     private lateinit var root: FrameLayout
@@ -46,6 +47,15 @@ class MainActivity : Activity() {
     private var job: Future<*>? = null
     private var scope: RequestScope? = null
     private var ticket = 0
+    private var seasonJob: Future<*>? = null
+    private var seasonScope: RequestScope? = null
+    private var seasonTicket = 0
+    private var seasonResultId = ""
+    private var seasonRows: List<Series> = emptyList()
+    private var seasonLoaded = false
+    private var pendingSeasonAutoplayId: String? = null
+    private var seasonButton: Button? = null
+    private var seasonLoadingDialog: AlertDialog? = null
     private var board = RankBoard.REAL
     private var page = 1
     private var query = ""
@@ -136,7 +146,7 @@ class MainActivity : Activity() {
             when {
                 playingScreen && player == null -> playEpisode(episode, detail?.let { prefs.getLong("position:${it.series.id}",0) } ?: 0)
                 playingScreen -> { showControls(); player?.let { prepareNext(it) } }
-                screenMode == "detail" -> requestedSeries?.let { showDetail(it) }
+                screenMode == "detail" -> requestedSeries?.let { showDetail(it, pendingSeasonAutoplayId == it.id) }
                 screenMode == "collection" -> showCollection(collectionMode)
                 screenMode == "ranking" -> showRanking()
                 screenMode == "category" -> showCategory()
@@ -149,13 +159,14 @@ class MainActivity : Activity() {
     override fun onStop() {
         started = false; wasStopped = true; main.removeCallbacks(clock)
         posters.cancelPage()
-        cancelJob(); prefetch.cancel(); pendingNextIndex=-1; prefetchAttempt=-1
+        cancelJob(); cancelSeasonLookup(); seasonLoadingDialog?.dismiss(); seasonLoadingDialog = null
+        prefetch.cancel(); pendingNextIndex=-1; prefetchAttempt=-1
         player?.pause(); saveProgress(); updatePlayback()
         super.onStop()
     }
     override fun onDestroy() {
         destroyed = true; dialog?.dismiss(); posters.close(); prefetch.close(); cancelJob(); releasePlayer(); session?.release()
-        worker.shutdownNow()
+        cancelSeasonLookup(); seasonWorker.shutdownNow(); worker.shutdownNow()
         cleanup.execute { repository.http.dispatcher.cancelAll(); repository.http.connectionPool.evictAll(); repository.http.dispatcher.executorService.shutdown() }
         cleanup.shutdown(); super.onDestroy()
     }
@@ -181,7 +192,7 @@ class MainActivity : Activity() {
         parent.addView(this,LinearLayout.LayoutParams(-2,dp(50)).apply { marginEnd=dp(5); bottomMargin=dp(4) })
     }
     private fun base(title: String): LinearLayout {
-        posters.cancelPage(); root.removeAllViews()
+        cancelSeasonLookup(); posters.cancelPage(); root.removeAllViews()
         return column().also { body ->
             body.setPadding(dp(26),dp(20),dp(26),dp(16)); root.addView(body,FrameLayout.LayoutParams(-1,-1))
             body.addView(text(title,25f).apply { setTypeface(null,Typeface.BOLD) })
@@ -194,7 +205,7 @@ class MainActivity : Activity() {
         shown.show()
     }
     private fun shell(title:String,current:String):LinearLayout {
-        posters.cancelPage(); root.removeAllViews()
+        cancelSeasonLookup(); posters.cancelPage(); root.removeAllViews()
         val body=column().apply { setPadding(dp(30),dp(12),dp(30),dp(12)) }
         root.addView(body,FrameLayout.LayoutParams(-1,-1))
         val header=row(); body.addView(header)
@@ -278,6 +289,7 @@ class MainActivity : Activity() {
                     status.text = when {
                         !online() -> "网络未连接，请检查电视网络。"
                         explanation.contains("播放接口暂不可用") -> "视频源未返回播放地址，请稍后重试。"
+                        explanation.contains("没有电视可播放的清晰度") || explanation.contains("当前片源暂无兼容") -> "这集暂未提供兼容编码，可重试或换一部。"
                         else -> "暂时无法播放，请重试或换一部。"
                     }
                     failure = explanation; retryButton?.visibility=View.VISIBLE; showControls()
@@ -382,7 +394,8 @@ class MainActivity : Activity() {
         showDialog(AlertDialog.Builder(this).setTitle("搜索短剧").setView(input)
             .setPositiveButton("搜索") { _,_-> query=input.text.toString().trim().take(80); page=1; selectedSeriesId=""; showHome() }.setNegativeButton("取消",null))
     }
-    private fun showDetail(series:Series) {
+    private fun showDetail(series:Series, autoplay: Boolean = false) {
+        pendingSeasonAutoplayId = series.id.takeIf { autoplay }
         if(screenMode=="home") homePosition=homeView?.capturePosition()
         if(screenMode in listOf("home","ranking","category","search","collection")) browseOrigin=screenMode
         cancelJob(); releasePlayer(); playingScreen=false; detail=null; requestedSeries=series; failure=null; screenMode="detail"
@@ -400,6 +413,28 @@ class MainActivity : Activity() {
         val fav=button(actions,if(isFavorite(series.id)) "✓ 已收藏" else "＋ 收藏") {}
         fav.setOnClickListener { fav.text=if(toggleFavorite(detail?.series ?: series)) "✓ 已收藏" else "＋ 收藏" }
         button(actions,"返回列表") { restoreBrowse() }
+        content.addView(text("同系列季度",19f))
+        val seasonScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
+        val seasonChoices = row(); seasonScroll.addView(seasonChoices)
+        content.addView(seasonScroll)
+        val seasonNote = text("正在查找其他季…",13f).apply { setTextColor(muted) }
+        content.addView(seasonNote)
+        fun renderSeasons(current: Series, others: List<Series>) {
+            val focusedSeason = seasonChoices.findFocus()?.tag as? String
+            seasonChoices.removeAllViews()
+            allSeasons(current, others).forEach { item ->
+                val selected = item.id == current.id
+                button(seasonChoices, SeriesSeasons.badge(item.title) + if (selected) " · 当前" else "") {
+                    if (!selected) showDetail(item)
+                }.apply {
+                    isSelected = selected; tag = item.id
+                    contentDescription = item.title + if (selected) "，当前季" else "，切换季度"
+                    paintButton(this,ButtonSize.COMPACT,ButtonTone.SECONDARY,false,selected)
+                    if (focusedSeason == item.id) requestFocus()
+                }
+            }
+        }
+        renderSeasons(series, emptyList())
         content.addView(text("选择集数",19f))
         val rangesScroll=HorizontalScrollView(this); val ranges=row(); rangesScroll.addView(ranges); content.addView(rangesScroll)
         val episodes=column(); content.addView(episodes)
@@ -420,6 +455,20 @@ class MainActivity : Activity() {
             }
             result.episodes.indices.step(40).forEach { start -> button(ranges,"${start+1}—${minOf(start+40,result.episodes.size)}") { render(start) } }
             render(last/40*40)
+            requestSeasons(result.series) { rows, error ->
+                if (screenMode == "detail" && detail?.series?.id == result.series.id) {
+                    renderSeasons(result.series, rows)
+                    seasonNote.text = when {
+                        error != null -> "季度暂未加载，稍后可从播放页重试。"
+                        rows.isEmpty() -> "暂未找到其他季。"
+                        else -> "左右选择季度，确认查看该季详情。"
+                    }
+                }
+            }
+            if (pendingSeasonAutoplayId == result.series.id) {
+                pendingSeasonAutoplayId = null
+                playEpisode(last,prefs.getLong("position:${result.series.id}",0))
+            }
         }
     }
     private fun ensureRegistered() {
@@ -437,6 +486,14 @@ class MainActivity : Activity() {
         // Register once per process: keep the server-issued ID and Cookie together in memory.
         registeredThisProcess = repository.registerDevice() != null
         android.util.Log.i("QingjuTV", "device registration: $registeredThisProcess")
+    }
+    private fun persistRegisteredProfile() {
+        val profile=JSONObject(repository.registerProfile).toString()
+        if(repository.registerProfile.isNotEmpty() && prefs.getString("profile",null)!=profile) {
+            prefs.edit().putString("profile",profile).apply()
+            android.util.Log.i("QingjuTV", "anonymous playback profile saved")
+        }
+        registeredThisProcess=repository.deviceIdentity.isNotEmpty()
     }
     private fun playEpisode(index: Int, start: Long = 0, resume:Boolean=true) {
         val data = detail ?: return
@@ -470,14 +527,19 @@ class MainActivity : Activity() {
         playButton=button(buttons,"暂停") { togglePlayback() }
         nextButton=button(buttons,"下一集") { nextEpisode() }.apply { isEnabled=index<data.episodes.lastIndex }
         button(buttons,"选集") { episodeDialog() }
+        seasonButton=button(buttons,"季度") { seasonDialog() }
         speedButton=button(buttons,"${speed} 倍") { speedDialog() }
         button(buttons,"画面") { frameDialog() }
         button(buttons,"更多") { moreDialog() }
         retryButton=button(buttons,"重新播放") { playEpisode(episode,prefs.getLong("position:${data.series.id}",start)) }.apply { visibility=View.GONE }
+        // Equal widths keep all eight controls (and the retry action) inside a 720p TV HUD.
+        for (i in 0 until buttons.childCount) buttons.getChildAt(i).layoutParams =
+            LinearLayout.LayoutParams(0,dp(50),1f).apply { marginEnd=dp(5); bottomMargin=dp(4) }
         showControls()
         load("正在准备播放…", {
             ensureRegistered()
             val info = repository.stream(data.episodes[index], prefs.getInt("quality", 480))
+            persistRegisteredProfile()
             val video = RemoteVideo(repository.http, info)
             try { video.prepare(); video } catch (error: Throwable) { video.close(); throw error }
         }) { video ->
@@ -544,6 +606,7 @@ class MainActivity : Activity() {
         pendingNextIndex=next;prefetchAttempt=next
         prefetch.schedule(seriesId,next,data.episodes[next],selectedQuality,{ index,requestedQuality,video ->
             if(player!==engine || detail?.series?.id!=seriesId || index!=episode+1 || requestedQuality!=prefs.getInt("quality",480) || !started) { video.close(); return@schedule }
+            persistRegisteredProfile()
             pendingNextIndex=-1;queuedVideos[index]=video
             engine.addMediaSource(mediaSource(index,video))
             android.util.Log.i("QingjuTV","queue-ready episode=${index+1} quality=${video.info.quality} player=${System.identityHashCode(engine)}")
@@ -562,7 +625,7 @@ class MainActivity : Activity() {
         queuedVideos.values.forEach { it.close() };queuedVideos.clear();remote?.close();remote=null
         player?.let { saveProgress(); player=null; videoView?.player=null; it.release() }
         session?.isActive = false
-        controls=null;stateLabel=null;speedButton=null;videoView=null;playbackProgress=null;retryButton=null;playButton=null;episodeTitle=null;previousButton=null;nextButton=null
+        controls=null;stateLabel=null;speedButton=null;videoView=null;playbackProgress=null;retryButton=null;playButton=null;episodeTitle=null;previousButton=null;nextButton=null;seasonButton=null
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
     private fun togglePlayback() {
@@ -624,6 +687,66 @@ class MainActivity : Activity() {
         val data=detail ?: return
         showDialog(AlertDialog.Builder(this).setTitle("选择集数").setSingleChoiceItems(data.episodes.indices.map { "第 ${it+1} 集" }.toTypedArray(),episode) { shown,index -> shown.dismiss(); playEpisode(index) }.setNegativeButton("取消",null))
     }
+    private fun cancelSeasonLookup() {
+        seasonTicket++; seasonScope?.cancel(); seasonScope = null
+        seasonJob?.cancel(true); seasonJob = null
+    }
+    private fun allSeasons(current: Series, others: List<Series>): List<Series> =
+        (listOf(current) + others).distinctBy { it.id }
+            .sortedWith(compareBy({ SeriesSeasons.season(it.title) }, { it.title }))
+
+    /** Independent from load(): metadata must never cancel a video request or stop playback. */
+    private fun requestSeasons(series: Series, done: (List<Series>, Throwable?) -> Unit) {
+        cancelSeasonLookup()
+        if (seasonLoaded && seasonResultId == series.id) { done(seasonRows, null); return }
+        seasonLoaded = false; seasonResultId = series.id; seasonRows = emptyList()
+        val token = seasonTicket
+        val request = RequestScope(); seasonScope = request
+        seasonJob = seasonWorker.submit {
+            var error: Throwable? = null
+            val rows = try { request.run { repository.seasons(series.id, series.title) } }
+                catch (problem: Exception) { error = problem; emptyList() }
+            main.post {
+                if (!destroyed && started && token == seasonTicket && detail?.series?.id == series.id) {
+                    seasonRows = rows; seasonLoaded = error == null && rows.isNotEmpty()
+                    seasonScope = null; seasonJob = null
+                    done(rows, error)
+                }
+            }
+        }
+    }
+    private fun seasonDialog() {
+        val current = detail?.series ?: return
+        if (seasonLoaded && seasonResultId == current.id) { showSeasonChoices(current, seasonRows); return }
+        showDialog(AlertDialog.Builder(this).setTitle("同系列季度").setMessage("正在查找其他季，视频继续播放…")
+            .setNegativeButton("取消",null),seasonButton)
+        val loading = dialog; seasonLoadingDialog = loading
+        requestSeasons(current) { rows, error ->
+            if (playingScreen && detail?.series?.id == current.id && dialog === loading && loading?.isShowing == true) {
+                seasonLoadingDialog = null
+                if (error == null) showSeasonChoices(current, rows)
+                else showDialog(AlertDialog.Builder(this).setTitle("同系列季度").setMessage("季度暂时无法加载，当前视频不受影响。")
+                    .setPositiveButton("重试") { _, _ -> seasonDialog() }.setNegativeButton("关闭",null),seasonButton)
+            }
+        }
+    }
+    private fun showSeasonChoices(current: Series, others: List<Series>) {
+        val choices = allSeasons(current, others)
+        val selected = choices.indexOfFirst { it.id == current.id }
+        val labels = choices.map { item ->
+            SeriesSeasons.badge(item.title) + if (item.id == current.id) " · 当前" else " · " +
+                if (prefs.contains("episode:${item.id}")) "继续第 ${prefs.getInt("episode:${item.id}",0)+1} 集" else "从第 1 集播放"
+        }.toTypedArray()
+        showDialog(AlertDialog.Builder(this).setTitle(if (others.isEmpty()) "同系列季度 · 暂未找到其他季" else "同系列季度")
+            .setSingleChoiceItems(labels, selected) { shown, index ->
+                val target = choices[index]
+                shown.dismiss()
+                if (target.id != current.id) {
+                    saveProgress()
+                    showDetail(target, autoplay = true)
+                }
+            }.setNegativeButton("关闭",null),seasonButton)
+    }
     private fun applyFrameMode() {
         val view=videoView ?: return
         val mode=prefs.getInt("frame-mode",0)
@@ -666,9 +789,9 @@ class MainActivity : Activity() {
         }.setNegativeButton("关闭",null))
     }
     private fun about() {
-        showDialog(AlertDialog.Builder(this).setTitle("青聚 · 0.4.0").setMessage("""为电视遥控器设计的短剧客户端。
+        showDialog(AlertDialog.Builder(this).setTitle("青聚 · ${packageManager.getPackageInfo(packageName,0).versionName}").setMessage("""为电视遥控器设计的短剧客户端。
 
-支持收藏、观看历史、续播与倍速。确认键暂停/继续；菜单键打开控制栏，左右选择倍速、画面等操作。
+支持收藏、观看历史、续播、倍速与同系列季度切换。确认键暂停/继续；菜单键打开控制栏，左右选择季度、倍速、画面等操作。
 
 本应用非红果官方客户端。内容接口基于HGTV / N3urda（GPL-3.0-only），播放器Media3（Apache-2.0）。完整对应源码和许可证随安装包提供。
 

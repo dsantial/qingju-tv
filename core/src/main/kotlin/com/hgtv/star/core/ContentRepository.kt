@@ -3,6 +3,7 @@ package com.hgtv.star.core
 
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.MediaType.Companion.toMediaType
 import org.json.JSONObject
@@ -222,24 +223,51 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
      */
     fun registerDevice(): DeviceRegister.Registered? {
         val device=LinkedHashMap(registerProfile).apply { putAll(deviceIdentity) }
+        val registered=requestRegistration(device,http)
+        if(registered!=null) {
+            deviceIdentity=linkedMapOf("device_id" to registered.deviceId,"iid" to registered.installId)
+            registrationCookies=LinkedHashMap(registrationCookies).apply { putAll(registered.cookies) }
+        }
+        return registered
+    }
+
+    private fun requestRegistration(device: Map<String,String>, transport: OkHttpClient): DeviceRegister.Registered? {
         val body=DeviceRegister.payload(device)
         val headers=DeviceRegister.headers(body,device)
-        val registered=runCatching {
+        return runCatching {
             val request=Request.Builder().url(DeviceRegister.url())
             headers.forEach { (key,value) -> request.header(key,value) }
             request.post(body.toRequestBody("application/octet-stream".toMediaType()))
-            RequestScope.execute(http.newCall(request.build())) { response ->
+            RequestScope.execute(transport.newCall(request.build())) { response ->
                 if(!response.isSuccessful) throw IOException("设备注册失败（HTTP ${response.code}）")
                 val bytes=response.body?.bytes() ?: throw IOException("设备注册响应为空")
                 DeviceRegister.parse(String(bytes,Charsets.UTF_8),response.headers("Set-Cookie"))
                     ?: throw IOException("设备注册被服务端拒绝")
             }
         }.getOrNull()
-        if(registered!=null) {
-            deviceIdentity=linkedMapOf("device_id" to registered.deviceId,"iid" to registered.installId)
-            registrationCookies=LinkedHashMap(registrationCookies).apply { putAll(registered.cookies) }
-        }
-        return registered
+    }
+
+    private var lastPlaybackRecovery: Long? = null
+
+    /** One bounded recovery for a cached anonymous profile after all hosts return empty 200s.
+     * Never reset account credentials or renew on an explicit service/HTTP rejection.
+     */
+    @Synchronized private fun recoverEmptyPlayback(expected: Map<String,String>): Boolean {
+        if(deviceIdentity!=expected && deviceIdentity.isNotEmpty()) return true
+        val now=clock()
+        if(registerProfile.isEmpty() || lastPlaybackRecovery?.let { now-it<TimeUnit.MINUTES.toMillis(5) }==true || Thread.currentThread().isInterrupted) return false
+        lastPlaybackRecovery=now
+        val fresh=registerProfile.filterKeys { it!="device_id" && it!="iid" } + mapOf(
+            "cdid" to java.util.UUID.randomUUID().toString(),
+            "openudid" to java.util.UUID.randomUUID().toString().replace("-", "").take(16))
+        val client=http.newBuilder().cookieJar(okhttp3.CookieJar.NO_COOKIES)
+            .connectTimeout(3,TimeUnit.SECONDS).readTimeout(5,TimeUnit.SECONDS).callTimeout(8,TimeUnit.SECONDS).build()
+        val registered=requestRegistration(fresh,client) ?: return false
+        if(Thread.currentThread().isInterrupted) return false
+        registerProfile=fresh
+        deviceIdentity=mapOf("device_id" to registered.deviceId,"iid" to registered.installId)
+        registrationCookies=registered.cookies
+        return true
     }
     /** 注册下发的 Cookie（`install_id` / `ttreq` / `store-region`），随注册请求一起带上。 */
     @Volatile private var registrationCookies: Map<String,String> = emptyMap()
@@ -285,6 +313,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
      */
     private val RELATED_CACHE_LIMIT=16
     private val relatedCache=linkedMapOf<String,RelatedWorks>()
+    private val seasonCache=linkedMapOf<String,Pair<Long,List<Series>>>()
     private val commentHosts=listOf("api5-normal-sinfonlinea.fqnovel.com","api5-normal-sinfonlinec.fqnovel.com","api5-normal-sinfonlineb.fqnovel.com","api5-normal-lf.fqnovel.com","api5-normal-lq.fqnovel.com","api5-normal-hl.fqnovel.com")
     private fun text(url: String, signed: Signer.Request? = null): String {
         val request = Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).header("Accept-Language","zh-CN,zh;q=0.9")
@@ -466,7 +495,11 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         val wanted=count.coerceIn(1,20)
         val url="$site/incent_resource/suggestion?app_id=$SUGGEST_APP_ID&web_id=$webId" +
             "&query=${Signer.encode(clean)}&count=$wanted"
-        val rows=JSONObject(text(url)).optJSONArray("suggest_list")?.objects() ?: return emptyList()
+        return parseSuggestions(text(url),wanted)
+    }
+
+    private fun parseSuggestions(raw: String, wanted: Int): List<SearchSuggestion> {
+        val rows=JSONObject(raw).optJSONArray("suggest_list")?.objects() ?: return emptyList()
         return rows.mapNotNull { row ->
             val name=row.str("name").ifEmpty { row.optJSONArray("display_words")?.optString(0).orEmpty() }.trim()
             if(name.isEmpty()) return@mapNotNull null
@@ -475,6 +508,42 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             val series=video?.let { card(it) }?.takeIf { it.id.matches(Regex("[0-9]{1,30}")) }
             SearchSuggestion(name,series,row.str("word_type"))
         }.distinctBy { it.name }.take(wanted)
+    }
+
+    /** Other available seasons only; a separate bounded metadata request never signs in. */
+    fun seasons(id: String, title: String): List<Series> {
+        require(id.matches(Regex("[0-9]{1,30}")))
+        val base=SeriesSeasons.base(title).trim()
+        val family=SeriesSeasons.normalize(title)
+        if(base.isEmpty() || family.isEmpty()) return emptyList()
+        synchronized(seasonCache) {
+            seasonCache[family]?.takeIf { clock()-it.first in 0 until TimeUnit.MINUTES.toMillis(10) }
+                ?.let { return it.second.filterNot { series -> series.id==id } }
+        }
+        val url="$site/incent_resource/suggestion?app_id=$SUGGEST_APP_ID&web_id=$webId&query=${Signer.encode(base)}&count=20"
+        val client=http.newBuilder().cookieJar(okhttp3.CookieJar.NO_COOKIES)
+            .connectTimeout(3,TimeUnit.SECONDS).readTimeout(5,TimeUnit.SECONDS).callTimeout(8,TimeUnit.SECONDS).build()
+        val request=Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).build()
+        val raw=RequestScope.execute(client.newCall(request)) { response ->
+            if(!response.isSuccessful) throw IOException("季度列表请求失败（HTTP ${response.code}）")
+            val body=response.body ?: throw IOException("季度列表响应为空")
+            val limit=2*1024*1024L
+            if(body.contentLength()>limit) throw IOException("季度列表响应过大")
+            val source=body.source()
+            source.request(limit+1)
+            if(source.buffer.size>limit) throw IOException("季度列表响应过大")
+            source.readUtf8()
+        }
+        val candidates=parseSuggestions(raw,20).mapNotNull { it.series }
+        // Retain the already known current season even if suggestions omit it; switching to
+        // another season must still let the viewer come back without a second search.
+        val found=SeriesSeasons.siblings(title,candidates+Series(id,title)).distinctBy { it.id }
+        val others=found.filterNot { it.id==id }
+        if(others.isNotEmpty()) synchronized(seasonCache) {
+            seasonCache[family]=clock() to found
+            while(seasonCache.size>16) seasonCache.remove(seasonCache.keys.first())
+        }
+        return others
     }
     /**
      * 热搜词：搜索页空输入时铺在下面那一排。
@@ -1077,18 +1146,20 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
      */
     private class PlaybackRejected(message: String): IOException(message)
 
-    private fun videoModel(id: String): JSONObject {
+    private fun videoModel(id: String, allowRecovery: Boolean = true): JSONObject {
         if (deviceIdentity.isEmpty() && registerDevice() == null) throw IOException("播放设备注册失败，请稍后重试")
+        val identity=deviceIdentity.toMap()
         val allowed = setOf("ac", "channel", "aid", "app_name", "version_code", "version_name",
             "device_platform", "os", "ssmix", "device_type", "device_brand", "language", "os_api",
             "os_version", "manifest_version_code", "resolution", "dpi", "update_version_code", "device_id", "iid")
-        val profile = (VendorConstants.device + deviceIdentity).filterKeys { it in allowed } + mapOf(
+        val profile = (VendorConstants.device + identity).filterKeys { it in allowed } + mapOf(
             "version_code" to "73532", "version_name" to "7.3.5.32",
             "manifest_version_code" to "73532", "update_version_code" to "73532")
         val payload = """{"biz_param":{"need_all_video_definition":true,"video_platform":3},"content_type":1,"video_id":"$id"}""".toByteArray()
         val client = http.newBuilder().cookieJar(okhttp3.CookieJar.NO_COOKIES)
             .connectTimeout(5, TimeUnit.SECONDS).readTimeout(8, TimeUnit.SECONDS).callTimeout(10, TimeUnit.SECONDS).build()
         var failure: IOException? = null
+        var emptyResponses=0
         for (host in listOf("api5-normal-sinfonlineb.fqnovel.com", "api5-normal-hl.fqnovel.com", "api5-normal-lf.fqnovel.com")) {
             try {
                 val now = clock()
@@ -1099,10 +1170,12 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                     .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
                 PlayerSignature().headers(query, payload, profile.getValue("device_id"), now)
                     .forEach { (key, value) -> request.header(key, value) }
+                var status=0
                 val raw = RequestScope.execute(client.newCall(request.build())) { response ->
+                    status=response.code
                     if (response.code in listOf(401, 403, 429)) throw PlaybackRejected("播放请求被拒绝（HTTP ${response.code}），请稍后重试")
                     if (!response.isSuccessful) throw IOException("播放请求失败（HTTP ${response.code}）")
-                    val body = response.body ?: throw IOException("播放接口暂不可用（空响应）")
+                    val body = response.body ?: return@execute ""
                     val limit = 2 * 1024 * 1024
                     if (body.contentLength() > limit) throw PlaybackRejected("播放信息过大")
                     val out = java.io.ByteArrayOutputStream()
@@ -1117,7 +1190,10 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                     if (out.size() > limit) throw PlaybackRejected("播放信息过大")
                     out.toString("UTF-8")
                 }
-                if (raw.isBlank()) throw IOException("播放接口暂不可用（空响应）")
+                if (raw.isBlank()) {
+                    if(status==200) emptyResponses++
+                    throw IOException("播放接口暂不可用（空响应）")
+                }
                 val root = runCatching { JSONObject(raw) }.getOrElse { throw PlaybackRejected("播放信息格式异常") }
                 val code = root.optInt("Code", root.optInt("code", root.optJSONObject("BaseResp")?.optInt("StatusCode", 0) ?: 0))
                 if (code != 0) throw PlaybackRejected("播放接口拒绝请求（$code），请稍后重试")
@@ -1130,17 +1206,34 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
                 failure = error
             }
         }
+        if(allowRecovery && emptyResponses==3 && recoverEmptyPlayback(identity)) return videoModel(id,false)
         throw failure ?: IOException("播放接口暂不可用")
     }
 
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
         val model = videoModel(id)
-        val info = if (model.has("video_list")) model else {
-            val fallback = PlaybackModels.fallback(model) ?: throw IOException("播放地址格式异常")
-            JSONObject(text(fallback)).optJSONObject("video_info")?.optJSONObject("data") ?: throw IOException("没有播放资源")
+        val inline = PlaybackModels.candidates(model)
+        if (inline.isNotEmpty()) return PlaybackModels.pick(inline, maxQuality)
+        val fallback = PlaybackModels.fallback(model)
+            ?: throw IOException("当前片源暂无兼容这台电视的编码，请换一部或稍后再试")
+        fun readFallback(url: String): JSONObject {
+            val root = JSONObject(text(url))
+            val code = root.optInt("Code", root.optInt("code", 0))
+            if (code != 0) throw PlaybackRejected("播放接口拒绝请求（$code），请稍后重试")
+            return root.optJSONObject("video_info")?.optJSONObject("data") ?: throw IOException("没有播放资源")
         }
-        return PlaybackModels.pick(PlaybackModels.candidates(info), maxQuality)
+        val legacy = readFallback(fallback)
+        var rows = PlaybackModels.candidates(legacy)
+        if (rows.isEmpty() && PlaybackModels.onlyByteVc2(legacy)) {
+            // The hint may still return HEVC or ByteVC2. Inspect the actual model, never trust
+            // the requested codec name or bypass the old television's codec filter.
+            val compatible = fallback.toHttpUrl().newBuilder()
+                .setQueryParameter("codec_type", "0").setQueryParameter("force_codec", "h264")
+                .build().toString()
+            rows = PlaybackModels.candidates(readFallback(compatible))
+        }
+        return PlaybackModels.pick(rows, maxQuality)
     }
     /**
      * 取一集的弹幕，也就是「原 App」播放时看到的同一份数据。

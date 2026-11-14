@@ -36,18 +36,31 @@ internal object PlaybackModels {
         return url(value)?.takeIf { it.startsWith("https://") }
     }
 
-    fun candidates(model: JSONObject): List<StreamInfo> {
+    private fun entries(model: JSONObject): List<Pair<String, JSONObject>> {
         val list = model.opt("video_list")
-        val entries = when (list) {
+        return when (list) {
             is JSONObject -> list.keys().asSequence().mapNotNull { name -> list.optJSONObject(name)?.let { name to it } }.toList()
             is JSONArray -> list.objects().map { "" to it }
             else -> emptyList()
         }
-        return entries.mapNotNull { (name, entry) ->
+    }
+
+    private fun unsupported(entry: JSONObject): Boolean {
+        val codec = listOf(entry.str("codec_type"), entry.str("gear_des_key"), entry.optJSONObject("video_meta")?.str("codec_type").orEmpty()).joinToString(" ").lowercase()
+        return codec.contains("bytevc2") || Regex("(^|[^a-z0-9])bvc2([^a-z0-9]|$)").containsMatchIn(codec)
+    }
+
+    /** Request compatibility once only when every offered track is a known unsupported codec. */
+    fun onlyByteVc2(model: JSONObject): Boolean {
+        val rows = entries(model)
+        return rows.isNotEmpty() && rows.all { (_, entry) -> entry.str("main_url").isNotEmpty() && unsupported(entry) }
+    }
+
+    fun candidates(model: JSONObject): List<StreamInfo> {
+        return entries(model).mapNotNull { (name, entry) ->
             runCatching {
                 val meta = entry.optJSONObject("video_meta")
-                val codec = listOf(entry.str("codec_type"), entry.str("gear_des_key"), meta?.str("codec_type").orEmpty()).joinToString(" ").lowercase()
-                if (codec.contains("bytevc2") || Regex("(^|[^a-z0-9])bvc2([^a-z0-9]|$)").containsMatchIn(codec)) return@runCatching null
+                if (unsupported(entry)) return@runCatching null
                 val encryption = entry.optJSONObject("encrypt_info")
                 val key = encryption?.str("spade_a").orEmpty().ifEmpty { entry.str("spade_a") }
                     .takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
