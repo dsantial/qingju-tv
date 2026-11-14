@@ -66,18 +66,26 @@ internal object PlaybackModels {
                     .takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
                 if (encryption != null && key == null && encryption.opt("encrypt") !in listOf(false, 0, "0", "false")) return@runCatching null
                 val seed = model.str("key_seed").takeIf { it.isNotEmpty() }?.let(::decode64)
-                val resolved = listOf("main_url", "play_url", "backup_url", "backup_url_1").firstNotNullOfOrNull { field ->
+                val addresses = listOf("main_url", "play_url", "backup_url", "backup_url_1", "backup_url_2").flatMap { field ->
+                    when(val value=entry.opt(field)) {
+                        is JSONArray -> (0 until value.length()).map { value.optString(it) }
+                        is String -> listOf(value)
+                        else -> emptyList()
+                    }
+                }.mapNotNull { value ->
                     runCatching {
-                        val raw = cleanUrl(entry.str(field))
+                        val raw = cleanUrl(value)
                         if (raw.isEmpty()) null else url(raw) ?: url(if (seed != null) MediaCrypto.decryptUrl(raw, seed) else String(decode64(raw), Charsets.UTF_8))
                     }.getOrNull()
-                } ?: return@runCatching null
+                }.distinct()
+                val resolved = addresses.firstOrNull() ?: return@runCatching null
                 val width = entry.optInt("vwidth", meta?.optInt("vwidth", 0) ?: 0)
                 val height = entry.optInt("vheight", meta?.optInt("vheight", 0) ?: 0)
                 val dimensions = if (width > 0 && height > 0) minOf(width, height).toString() else ""
                 val definition = entry.str("quality_desc").ifEmpty { meta?.str("definition").orEmpty() }
                     .ifEmpty { dimensions.ifEmpty { entry.str("height").ifEmpty { entry.str("vheight").ifEmpty { entry.str("quality").ifEmpty { name } } } } }
-                StreamInfo(resolved, key, ContentRepository.qualityNumber(definition).toString())
+                StreamInfo(resolved, key, ContentRepository.qualityNumber(definition).toString(),addresses.drop(1),
+                    meta?.optLong("size",0L)?.takeIf { it>0 } ?: entry.optLong("size",0L).takeIf { it>0 })
             }.getOrNull()
         }
     }

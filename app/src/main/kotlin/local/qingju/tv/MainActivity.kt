@@ -22,6 +22,7 @@ import androidx.media3.common.*
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.ui.PlayerView
@@ -33,6 +34,8 @@ import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
+import java.io.File
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 class MainActivity : Activity() {
@@ -64,10 +67,20 @@ class MainActivity : Activity() {
     private var player: ExoPlayer? = null
     private var remote: RemoteVideo? = null
     private lateinit var prefetch: EpisodePrefetch
+    private var videoCache: VideoCacheStore?=null
+    @Volatile private var prefetchAllowed=false
+    private val mediaHttp=repository.http.newBuilder().connectTimeout(5,TimeUnit.SECONDS)
+        .readTimeout(10,TimeUnit.SECONDS).callTimeout(25,TimeUnit.SECONDS).build()
     private val queuedVideos=linkedMapOf<Int,RemoteVideo>()
-    private var pendingNextIndex=-1
-    private var prefetchAttempt=-1
-    private var prefetchFailures=0
+    private var actualDecoder="尚未初始化"
+    private var decoderName=""
+    private var bufferingSince=0L
+    private var rebufferCount=0
+    private var rebufferMs=0L
+    private var nextWaitSince=0L
+    private var nextWaitMs=0L
+    private var everReady=false
+    private var droppedFrames=0
     private var consumedRemoteKey=-1
     private var episodeTitle:TextView?=null
     private var previousButton:Button?=null
@@ -125,7 +138,9 @@ class MainActivity : Activity() {
         root = FrameLayout(this).apply { setBackgroundColor(TvStyle.background) }
         setContentView(root)
         posters = PosterLoader(this)
-        prefetch=EpisodePrefetch(repository)
+        videoCache=try { VideoCacheStore(File(cacheDir,"episode-video-cache")) }
+            catch(error: Exception) { android.util.Log.w("QingjuTV","disk cache unavailable ${error.javaClass.simpleName}");null }
+        prefetch=EpisodePrefetch(repository,videoCache) { prefetchAllowed }
         speed = prefs.getFloat("speed", 1f).coerceIn(0.5f, 2f)
         session = MediaSession(this, "QingjuTV").apply {
             setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
@@ -160,14 +175,14 @@ class MainActivity : Activity() {
         started = false; wasStopped = true; main.removeCallbacks(clock)
         posters.cancelPage()
         cancelJob(); cancelSeasonLookup(); seasonLoadingDialog?.dismiss(); seasonLoadingDialog = null
-        prefetch.cancel(); pendingNextIndex=-1; prefetchAttempt=-1
+        prefetchAllowed=false;prefetch.cancel()
         player?.pause(); saveProgress(); updatePlayback()
         super.onStop()
     }
     override fun onDestroy() {
         destroyed = true; dialog?.dismiss(); posters.close(); prefetch.close(); cancelJob(); releasePlayer(); session?.release()
         cancelSeasonLookup(); seasonWorker.shutdownNow(); worker.shutdownNow()
-        cleanup.execute { repository.http.dispatcher.cancelAll(); repository.http.connectionPool.evictAll(); repository.http.dispatcher.executorService.shutdown() }
+        cleanup.execute { videoCache?.close(); repository.http.dispatcher.cancelAll(); repository.http.connectionPool.evictAll(); repository.http.dispatcher.executorService.shutdown() }
         cleanup.shutdown(); super.onDestroy()
     }
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
@@ -540,20 +555,35 @@ class MainActivity : Activity() {
             ensureRegistered()
             val info = repository.stream(data.episodes[index], prefs.getInt("quality", 480))
             persistRegisteredProfile()
-            val video = RemoteVideo(repository.http, info)
+            val video = RemoteVideo(mediaHttp, info,videoCache)
             try { video.prepare(); video } catch (error: Throwable) { video.close(); throw error }
         }) { video ->
             remote = video; queuedVideos[index]=video; quality = video.info.quality
-            val renderers = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
+            actualDecoder="正在初始化";decoderName="";bufferingSince=0;rebufferCount=0;rebufferMs=0;nextWaitSince=0;nextWaitMs=0;everReady=false;droppedFrames=0
+            val mode=DecoderPolicy.Mode.fromStored(prefs.getString("decoder-mode","auto"))
+            val renderers = DefaultRenderersFactory(this).setMediaCodecSelector(DecoderPolicy.selector(mode)).setEnableDecoderFallback(true)
             val engine = ExoPlayer.Builder(this, renderers).setLoadControl(DefaultLoadControl.Builder()
-                .setBufferDurationsMs(5000, 15000, 1500, 2500).setTargetBufferBytes(8 * 1024 * 1024).setPrioritizeTimeOverSizeThresholds(false).build()).build()
+                .setBufferDurationsMs(15000, 60000, 2500, 6000).setTargetBufferBytes(16 * 1024 * 1024).setPrioritizeTimeOverSizeThresholds(false).build()).build()
             player = engine; view.player = engine
             engine.setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true)
+            engine.addAnalyticsListener(object: AnalyticsListener {
+                override fun onVideoDecoderInitialized(eventTime: AnalyticsListener.EventTime, name: String, initializedTimestampMs: Long, initializationDurationMs: Long) {
+                    if(player!==engine) return
+                    decoderName=name;refreshDecoderLabel(engine)
+                    android.util.Log.i("QingjuTV","decoder initialized name=$name elapsedMs=$initializationDurationMs")
+                }
+                override fun onDroppedVideoFrames(eventTime: AnalyticsListener.EventTime, count: Int, elapsedMs: Long) {
+                    if(player!==engine) return
+                    droppedFrames+=count
+                    android.util.Log.i("QingjuTV","decoder dropped=$count windowMs=$elapsedMs total=$droppedFrames")
+                }
+            })
             engine.addListener(object : Player.Listener {
                 override fun onVideoSizeChanged(size:VideoSize) {
                     if(player!==engine) return
                     sourcePortrait=size.height>size.width
                     applyFrameMode()
+                    refreshDecoderLabel(engine)
                     android.util.Log.i("QingjuTV","video-size ${size.width}x${size.height} portrait=$sourcePortrait surface=TextureView")
                 }
                 override fun onPlayerError(error: PlaybackException) {
@@ -563,11 +593,27 @@ class MainActivity : Activity() {
                 }
                 override fun onPlaybackStateChanged(state: Int) {
                     if(player!==engine) return
+                    val now=SystemClock.elapsedRealtime()
+                    if(state==Player.STATE_BUFFERING && bufferingSince==0L) {
+                        bufferingSince=now
+                        if(everReady) rebufferCount++
+                    } else if(state!=Player.STATE_BUFFERING && bufferingSince!=0L) {
+                        if(everReady) {
+                            val waited=now-bufferingSince
+                            rebufferMs+=waited
+                            android.util.Log.i("QingjuTV","buffer-end episode=${episode+1} waitedMs=$waited state=$state player=${System.identityHashCode(engine)}")
+                        }
+                        bufferingSince=0
+                    }
+                    if(state==Player.STATE_READY) everReady=true
                     updatePlayback()
                     if(state==Player.STATE_READY) prepareNext(engine)
                     if(state==Player.STATE_ENDED) {
                         saveProgress()
-                        if(episode<data.episodes.lastIndex) { status.text="正在准备下一集…"; prepareNext(engine); showControls() }
+                        if(episode<data.episodes.lastIndex) {
+                            if(nextWaitSince==0L) nextWaitSince=now
+                            status.text="正在准备下一集…"; prepareNext(engine); showControls()
+                        }
                         else { status.text="本剧已播放完"; engine.pause(); showControls() }
                     }
                 }
@@ -575,7 +621,12 @@ class MainActivity : Activity() {
                     if(player!==engine) return
                     val next=item?.mediaId?.toIntOrNull() ?: return
                     val changed=episode!=next
-                    episode=next; if(changed) prefetchFailures=0; remote=queuedVideos[next]; quality=remote?.info?.quality.orEmpty(); failure=null
+                    if(changed && nextWaitSince!=0L) {
+                        val waited=SystemClock.elapsedRealtime()-nextWaitSince
+                        nextWaitMs+=waited;nextWaitSince=0
+                        android.util.Log.i("QingjuTV","next-episode-wait episode=${next+1} waitedMs=$waited")
+                    }
+                    episode=next; remote=queuedVideos[next]; quality=remote?.info?.quality.orEmpty(); failure=null
                     episodeTitle?.text="${data.series.title} · 第 ${next+1} 集"
                     previousButton?.isEnabled=next>0; nextButton?.isEnabled=next<data.episodes.lastIndex
                     if(changed) prefs.edit().putInt("episode:${data.series.id}",next).putLong("position:${data.series.id}",0).apply()
@@ -600,28 +651,42 @@ class MainActivity : Activity() {
         .createMediaSource(MediaItem.Builder().setUri(video.info.url).setMediaId(index.toString()).build())
     private fun prepareNext(engine:ExoPlayer) {
         val data=detail ?: return
-        val next=episode+1
-        if(!started || player!==engine || engine.playbackState !in listOf(Player.STATE_READY,Player.STATE_ENDED) || next !in data.episodes.indices || queuedVideos.containsKey(next) || pendingNextIndex==next || prefetchAttempt==next) return
-        val seriesId=data.series.id; val selectedQuality=prefs.getInt("quality",480)
-        pendingNextIndex=next;prefetchAttempt=next
-        prefetch.schedule(seriesId,next,data.episodes[next],selectedQuality,{ index,requestedQuality,video ->
-            if(player!==engine || detail?.series?.id!=seriesId || index!=episode+1 || requestedQuality!=prefs.getInt("quality",480) || !started) { video.close(); return@schedule }
-            persistRegisteredProfile()
-            pendingNextIndex=-1;queuedVideos[index]=video
-            engine.addMediaSource(mediaSource(index,video))
-            android.util.Log.i("QingjuTV","queue-ready episode=${index+1} quality=${video.info.quality} player=${System.identityHashCode(engine)}")
-            if(engine.playbackState==Player.STATE_ENDED && engine.hasNextMediaItem()) { val resume=engine.playWhenReady;engine.seekToNextMediaItem();engine.playWhenReady=resume }
-        },{ index,error ->
-            if(player===engine && pendingNextIndex==index) {
-                pendingNextIndex=-1;prefetchFailures++
-                if(prefetchFailures<2) main.postDelayed({ if(player===engine && episode+1==index && started && !queuedVideos.containsKey(index)) { prefetchAttempt=-1;prepareNext(engine) } },10000)
-                android.util.Log.w("QingjuTV","next-prefetch failed: ${error.javaClass.simpleName}")
-                if(engine.playbackState==Player.STATE_ENDED) { status.text="下一集未准备好，请按下一集重试。";showControls();nextButton?.requestFocus() }
-            }
-        })
+        if(!started || player!==engine) return
+        val depth=prefs.getInt("cache-ahead",3).coerceIn(0,3)
+        val selectedQuality=prefs.getInt("quality",480)
+        prefetch.maintain(data.series.id,episode,data.episodes,selectedQuality,queuedVideos.toMap(),depth,
+            onPrepared=ready@ { index,requestedQuality,video ->
+                if(player!==engine || detail?.series?.id!=data.series.id || index<=episode || index>episode+maxOf(1,depth) || requestedQuality!=prefs.getInt("quality",480) || !started) {
+                    video.close();return@ready
+                }
+                persistRegisteredProfile()
+                queuedVideos[index]=video
+                appendReadyVideos(engine)
+                val readyStats=video.stats()
+                android.util.Log.i("QingjuTV","queue-ready episode=${index+1} player=${System.identityHashCode(engine)} sourceHost=${readyStats.sourceHost} networkBytes=${readyStats.networkBytes} networkMs=${readyStats.networkMillis} headerMs=${readyStats.lastHeaderMs} bodyMs=${readyStats.lastBodyMs} trailerMs=${readyStats.lastTrailerMs}")
+                if(engine.playbackState==Player.STATE_ENDED && engine.hasNextMediaItem()) {
+                    val resume=engine.playWhenReady;engine.seekToNextMediaItem();engine.playWhenReady=resume
+                }
+            },
+            onError={ index,error ->
+                if(player===engine) {
+                    android.util.Log.w("QingjuTV","prefetch unavailable episode=${index+1} type=${error.javaClass.simpleName}")
+                    if(engine.playbackState==Player.STATE_ENDED && index==episode+1 && !queuedVideos.containsKey(index)) {
+                        status.text="下一集未准备好，请按下一集重试。";showControls();nextButton?.requestFocus()
+                    }
+                }
+            })
+    }
+    private fun appendReadyVideos(engine: ExoPlayer) {
+        val existing=(0 until engine.mediaItemCount).mapNotNull { engine.getMediaItemAt(it).mediaId.toIntOrNull() }.toMutableSet()
+        val depth=maxOf(1,prefs.getInt("cache-ahead",3).coerceIn(0,3))
+        for(index in episode+1..episode+depth) {
+            val video=queuedVideos[index] ?: break
+            if(existing.add(index)) engine.addMediaSource(mediaSource(index,video))
+        }
     }
     private fun releasePlayer() {
-        prefetch.cancel();pendingNextIndex=-1;prefetchAttempt=-1;prefetchFailures=0
+        prefetchAllowed=false;prefetch.cancel()
         queuedVideos.values.forEach { it.close() };queuedVideos.clear();remote?.close();remote=null
         player?.let { saveProgress(); player=null; videoView?.player=null; it.release() }
         session?.isActive = false
@@ -638,18 +703,41 @@ class MainActivity : Activity() {
     }
     private fun updatePlayback() {
         val engine = player ?: return
+        val buffered=engine.totalBufferedDuration.coerceAtLeast(0)
+        val rate=engine.playbackParameters.speed.coerceAtLeast(.5f)
+        val remaining=(engine.duration-engine.currentPosition).coerceAtLeast(0)
+        val stats=remote?.stats()
+        val required=if(engine.duration>0 && remote!=null) remote!!.total*1000.0/engine.duration*rate else 0.0
+        val measured=if(stats!=null && stats.networkMillis>0) stats.networkBytes*1000.0/stats.networkMillis else 0.0
+        val enoughThroughput=stats==null || stats.requests<2 || required<=0 || measured>=required*1.4
+        val entirelyBuffered=engine.duration>0 && buffered>=remaining-250
+        prefetchAllowed=started && (
+            engine.playbackState==Player.STATE_ENDED ||
+            engine.playbackState==Player.STATE_READY && (!engine.playWhenReady || remote?.fullyCached==true || entirelyBuffered || buffered/rate>=12000 && enoughThroughput))
+        prepareNext(engine)
         playButton?.text=if(engine.playWhenReady) "暂停" else "继续"
         if (!draggingProgress && engine.duration>0) playbackProgress?.progress=(engine.currentPosition*1000/engine.duration).toInt().coerceIn(0,1000)
         if (failure == null) {
             val state = when(engine.playbackState) { Player.STATE_BUFFERING -> "缓冲中"; Player.STATE_READY -> if (engine.isPlaying) "播放中" else "已暂停"; Player.STATE_ENDED -> "已结束"; else -> "正在准备" }
-            stateLabel?.text = "$state   ${time(engine.currentPosition)} / ${time(engine.duration)}   ·   $quality"
+            val ahead=prefs.getInt("cache-ahead",3).coerceIn(0,3)
+            val cacheNote=if(videoCache==null) "缓存不可用" else if(ahead==0) "下一集轻量预读" else "后续缓存 ${prefetch.completedAhead()}/$ahead 集"
+            stateLabel?.text = "$state   ${time(engine.currentPosition)} / ${time(engine.duration)}   ·   $quality   ·   缓冲 ${buffered/1000}秒   ·   $cacheNote"
         }
         if (engine.isPlaying) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         session?.setPlaybackState(PlaybackState.Builder().setActions(PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_SEEK_TO or PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS)
             .setState(if (engine.isPlaying) PlaybackState.STATE_PLAYING else if (engine.playbackState == Player.STATE_BUFFERING) PlaybackState.STATE_BUFFERING else PlaybackState.STATE_PAUSED, engine.currentPosition.coerceAtLeast(0), if (engine.isPlaying) engine.playbackParameters.speed else 0f).build())
         if (SystemClock.elapsedRealtime() - lastLog > 10000) {
             lastLog = SystemClock.elapsedRealtime(); saveProgress()
-            android.util.Log.i("QingjuTV", "playback state=${engine.playbackState} playing=${engine.isPlaying} position=${engine.currentPosition} duration=${engine.duration} speed=${engine.playbackParameters.speed}")
+            android.util.Log.i("QingjuTV", "playback state=${engine.playbackState} playing=${engine.isPlaying} position=${engine.currentPosition} duration=${engine.duration} speed=$rate bufferedMs=$buffered decoder=$decoderName dropped=$droppedFrames stalls=$rebufferCount stallMs=$rebufferMs nextWaitMs=$nextWaitMs networkBytes=${stats?.networkBytes} networkMs=${stats?.networkMillis} sourceHost=${stats?.sourceHost} headerMs=${stats?.lastHeaderMs} bodyMs=${stats?.lastBodyMs} trailerMs=${stats?.lastTrailerMs} cacheHit=${stats?.cacheHitBytes} currentCached=${stats?.cachedBytes} currentTotal=${stats?.totalBytes} aheadFull=${prefetch.completedAhead()} diskBytes=${videoCache?.usedBytes} prefetch=$prefetchAllowed")
+        }
+    }
+    private fun refreshDecoderLabel(engine: ExoPlayer) {
+        val info=DecoderPolicy.inspect(engine.videoFormat).decoders.firstOrNull { it.name==decoderName }
+        actualDecoder=when {
+            info?.software==true -> "系统软解"
+            info?.hardware==true -> "硬件解码"
+            decoderName.isNotBlank() -> "系统解码"
+            else -> "正在初始化"
         }
     }
     private fun time(ms: Long): String { val n = ms.coerceAtLeast(0) / 1000; return "%02d:%02d".format(n / 60, n % 60) }
@@ -685,7 +773,69 @@ class MainActivity : Activity() {
     }
     private fun episodeDialog() {
         val data=detail ?: return
-        showDialog(AlertDialog.Builder(this).setTitle("选择集数").setSingleChoiceItems(data.episodes.indices.map { "第 ${it+1} 集" }.toTypedArray(),episode) { shown,index -> shown.dismiss(); playEpisode(index) }.setNegativeButton("取消",null))
+        showDialog(AlertDialog.Builder(this).setTitle("选择集数").setSingleChoiceItems(data.episodes.indices.map { "第 ${it+1} 集" }.toTypedArray(),episode) { shown,index ->
+            shown.dismiss()
+            val engine=player
+            val queued=engine?.let { active -> (0 until active.mediaItemCount).firstOrNull { active.getMediaItemAt(it).mediaId==index.toString() } }
+            if(engine!=null && queued!=null) { saveProgress();engine.seekTo(queued,0);engine.play() } else playEpisode(index)
+        }.setNegativeButton("取消",null))
+    }
+    private fun decoderDialog() {
+        val engine=player ?: return
+        val modes=DecoderPolicy.Mode.entries
+        val current=DecoderPolicy.Mode.fromStored(prefs.getString("decoder-mode","auto"))
+        val labels=modes.map { mode -> mode.label+if(DecoderPolicy.selectionProblem(mode,engine.videoFormat)!=null) " · 当前片源不可用" else "" }.toTypedArray()
+        showDialog(AlertDialog.Builder(this).setTitle("解码方式 · 当前$actualDecoder")
+            .setSingleChoiceItems(labels,modes.indexOf(current)) { shown,index ->
+                val target=modes[index]
+                val problem=DecoderPolicy.selectionProblem(target,engine.videoFormat)
+                if(problem!=null) {
+                    (shown as AlertDialog).listView.setItemChecked(modes.indexOf(current),true)
+                    Toast.makeText(this,problem,Toast.LENGTH_LONG).show()
+                } else {
+                    val position=engine.currentPosition.coerceAtLeast(0);val resume=engine.playWhenReady
+                    prefs.edit().putString("decoder-mode",target.value).apply();shown.dismiss()
+                    if(target!=current) playEpisode(episode,position,resume)
+                }
+            }.setNegativeButton("关闭",null))
+    }
+    private fun cacheDialog() {
+        val values=intArrayOf(0,1,2,3)
+        val labels=arrayOf("仅下一集开头，不整集缓存","提前缓存后 1 集","提前缓存后 2 集","提前缓存后 3 集（推荐）")
+        showDialog(AlertDialog.Builder(this).setTitle("后续整集预缓存 · 看完自动清理")
+            .setSingleChoiceItems(labels,values.indexOf(prefs.getInt("cache-ahead",3))) { shown,index ->
+                val count=values[index];prefs.edit().putInt("cache-ahead",count).apply();shown.dismiss()
+                prefetch.cancel()
+                val engine=player
+                if(engine!=null) {
+                    val last=episode+maxOf(1,count)
+                    for(item in engine.mediaItemCount-1 downTo 0) {
+                        if((engine.getMediaItemAt(item).mediaId.toIntOrNull() ?: episode)>last) engine.removeMediaItem(item)
+                    }
+                    queuedVideos.keys.filter { it>last }.forEach { key -> queuedVideos.remove(key)?.let { video -> cleanup.execute { video.close() } } }
+                    updatePlayback()
+                }
+            }.setNegativeButton("关闭",null))
+    }
+    private fun playbackDiagnostics() {
+        val engine=player ?: return
+        val stats=remote?.stats()
+        val speed=if(stats!=null && stats.networkMillis>0) stats.networkBytes*1000L/stats.networkMillis/1024 else 0L
+        val size=(videoCache?.usedBytes ?: 0)/1024/1024
+        val message="""当前解码：$actualDecoder
+$decoderName
+已缓冲：${engine.totalBufferedDuration/1000}秒视频（${((engine.totalBufferedDuration/engine.playbackParameters.speed)/1000).toLong()}秒实际播放）
+本集所选线路读取均速：$speed KiB/s（非宽带测速）
+本集缓存命中：${(stats?.cacheHitBytes ?: 0)/1024/1024} MiB
+本集磁盘数据：${(stats?.cachedBytes ?: 0)/1024/1024} / ${(stats?.totalBytes ?: 0)/1024/1024} MiB
+后续整集完成：${prefetch.completedAhead()} 集
+磁盘缓存：$size / 192 MiB；单集上限64 MiB
+看完、跳过或退出播放自动清理；当前缓冲不足时暂停预缓存。
+缓冲次数：$rebufferCount；已记录缓冲时长：${rebufferMs/1000}秒；丢帧：$droppedFrames
+片尾等待下一集：${(nextWaitMs+if(nextWaitSince>0) SystemClock.elapsedRealtime()-nextWaitSince else 0)/1000}秒
+
+软解仅使用电视系统已有解码器，部分HEVC片源没有可用软解。"""
+        showDialog(AlertDialog.Builder(this).setTitle("播放与缓存状态").setMessage(message).setPositiveButton("关闭",null))
     }
     private fun cancelSeasonLookup() {
         seasonTicket++; seasonScope?.cancel(); seasonScope = null
@@ -776,15 +926,18 @@ class MainActivity : Activity() {
     }
     private fun moreDialog() {
         val data=detail ?: return
-        val labels=mutableListOf("清晰度","画面比例",if(isFavorite(data.series.id)) "取消收藏" else "收藏这部剧","返回剧集详情")
+        val labels=mutableListOf("清晰度","画面比例","解码方式","后续整集预缓存","播放与缓存状态",if(isFavorite(data.series.id)) "取消收藏" else "收藏这部剧","返回剧集详情")
         if(failure!=null) labels.add("查看错误详情")
         showDialog(AlertDialog.Builder(this).setTitle("播放选项").setItems(labels.toTypedArray()) { _,index ->
             when(index) {
                 0 -> qualityDialog()
                 1 -> frameDialog()
-                2 -> { val added=toggleFavorite(data.series);Toast.makeText(this,if(added) "已加入收藏" else "已取消收藏",Toast.LENGTH_SHORT).show() }
-                3 -> showDetail(data.series)
-                4 -> showDialog(AlertDialog.Builder(this).setTitle("错误详情").setMessage(failure).setPositiveButton("知道了",null))
+                2 -> decoderDialog()
+                3 -> cacheDialog()
+                4 -> playbackDiagnostics()
+                5 -> { val added=toggleFavorite(data.series);Toast.makeText(this,if(added) "已加入收藏" else "已取消收藏",Toast.LENGTH_SHORT).show() }
+                6 -> showDetail(data.series)
+                7 -> showDialog(AlertDialog.Builder(this).setTitle("错误详情").setMessage(failure).setPositiveButton("知道了",null))
             }
         }.setNegativeButton("关闭",null))
     }

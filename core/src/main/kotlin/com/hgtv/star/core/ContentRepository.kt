@@ -48,7 +48,7 @@ data class SearchSuggestion(
 data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null)
-data class StreamInfo(val url: String, val key: ByteArray?, val quality: String)
+data class StreamInfo @JvmOverloads constructor(val url: String, val key: ByteArray?, val quality: String, val backupUrls: List<String> = emptyList(), val expectedBytes: Long? = null)
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 /**
  * 这个请求需要登录态，而本机还没有可用的凭据（或凭据已失效）。
